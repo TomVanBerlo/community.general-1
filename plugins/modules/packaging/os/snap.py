@@ -49,6 +49,14 @@ options:
         type: str
         required: false
         default: stable
+    package_url:
+        description:
+            - Install snap package from a given url. THe package.assert file has to be
+              at the same location as the specified package.snap file. Only the extension
+              must be different.
+              This option can only be specified if there is a single snap in the task.
+        type: str
+        required: false
 
 author:
     - Victor Carceler (@vcarceler) <vcarceler@iespuigcastellar.xeill.net>
@@ -80,6 +88,14 @@ EXAMPLES = '''
   community.general.snap:
     name: foo
     channel: latest/edge
+
+# Install a snap from a given url
+  - name: Install foo from url
+    community.general.snap:
+      name: foo
+      state: present
+      classic: yes
+      package_url: "{{ foo_package_url }}"
 '''
 
 RETURN = '''
@@ -107,9 +123,55 @@ snaps_removed:
 
 import operator
 import re
+import requests
+import os
 
 from ansible.module_utils.basic import AnsibleModule
 
+DOWNLOAD_DIR = os.environ.get('HOME', '/tmp')
+
+def is_downloadable(url):
+    """
+    Does the url contain a downloadable resource
+    """
+    h = requests.head(url, allow_redirects=True)
+    header = h.headers
+    content_type = header.get('content-type')
+    if 'text' in content_type.lower():
+        return False
+    if 'html' in content_type.lower():
+        return False
+    return True
+
+def validate_url(url):
+    if not is_downloadable(url):
+        module.fail_json(msg="Url '%s' is not downloadable." % url )
+
+def download_file(url):
+    filename = re.sub(r'^.*\/(.*)',r'\1',url)
+
+    r = requests.get(url, allow_redirects=True)
+
+    with open(DOWNLOAD_DIR + '/' + filename, 'wb') as f:
+        f.write(r.content)
+
+def ack_assert_file(module, local_assert_file):
+    snap_path = module.get_bin_path("snap", True)
+    cmd_parts = [snap_path, 'ack', local_assert_file]
+    cmd = ' '.join(cmd_parts)
+    rc, out, err = module.run_command(cmd, check_rc=True)
+
+def validate_and_download_files(module):
+    snap_file_url = module.params['package_url']
+    assert_file_url = re.sub(r'^(.*)\.snap$',r'\1.assert', snap_file_url)
+    local_base_filename = re.sub(r'^.*\/(.*)\.snap$',r'\1', snap_file_url)
+    urls = [ snap_file_url, assert_file_url ]
+
+    for url in urls:
+        validate_url(url)
+        download_file(url)
+
+    return DOWNLOAD_DIR + '/' + local_base_filename
 
 def validate_input_snaps(module):
     """Ensure that all exist."""
@@ -176,7 +238,7 @@ def get_cmd_parts(module, snap_names):
     has_multiple_snaps = len(snap_names) > 1
 
     cmd_parts = get_base_cmd_parts(module)
-    has_one_pkg_params = '--classic' in cmd_parts or '--channel' in cmd_parts
+    has_one_pkg_params = '--classic' in cmd_parts or '--channel' in cmd_parts or module.params['package_url']
 
     if not (is_install_mode and has_one_pkg_params and has_multiple_snaps):
         return [cmd_parts + snap_names]
@@ -193,7 +255,7 @@ def run_cmd_for(module, snap_names):
     return (cmd, ) + module.run_command(cmd, check_rc=False)
 
 
-def execute_action(module):
+def execute_action(module, local_file = ''):
     is_install_mode = module.params['state'] == 'present'
     exit_kwargs = {
         'classic': module.params['classic'],
@@ -214,7 +276,11 @@ def execute_action(module):
     if module.check_mode:
         module.exit_json(**dict(changed_def_args, **exit_kwargs))
 
-    cmd, rc, out, err = run_cmd_for(module, actionable_snaps)
+    if local_file:
+        cmd, rc, out, err = run_cmd_for(module, [local_file])
+    else:
+        cmd, rc, out, err = run_cmd_for(module, actionable_snaps)
+
     cmd_out_args = {
         'cmd': cmd,
         'rc': rc,
@@ -240,16 +306,26 @@ def main():
         'state': dict(type='str', required=False, default='present', choices=['absent', 'present']),
         'classic': dict(type='bool', required=False, default=False),
         'channel': dict(type='str', required=False, default='stable'),
+        'package_url': dict(type='str', required=False, default='')
     }
     module = AnsibleModule(
         argument_spec=module_args,
         supports_check_mode=True,
+        mutually_exclusive=[
+          ('package_url', 'channel')
+        ]
     )
 
-    validate_input_snaps(module)
 
-    # Apply changes to the snaps
-    execute_action(module)
+    if module.params['package_url']:
+        local_file = validate_and_download_files(module)
+        ack_assert_file(module, local_file + '.assert')
+        # Install local snap
+        execute_action(module, local_file + '.snap')
+    else:
+        validate_input_snaps(module)
+        # Apply changes to the snaps
+        execute_action(module)
 
 
 if __name__ == '__main__':
